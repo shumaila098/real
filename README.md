@@ -1,3 +1,13 @@
+---
+title: Realtim Prediction Service
+emoji: 📈
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Realtim Prediction Service (scikit-learn)
 
 A small FastAPI microservice that predicts **customer behaviour** and **product
