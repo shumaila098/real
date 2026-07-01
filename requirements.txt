@@ -1,0 +1,9 @@
+# Prediction microservice (scikit-learn). Runs separately from the Cloudflare
+# Worker because scikit-learn is Python and can't execute on the Worker runtime.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+scikit-learn>=1.4
+pandas>=2.1
+numpy>=1.26
+joblib>=1.3
+python-dateutil>=2.9

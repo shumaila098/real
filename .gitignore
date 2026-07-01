@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Trained models are generated on first boot (app.py._ensure_models trains
+# them if models/ is empty) — don't ship the binaries, keeps the repo small
+# and avoids GitHub's 100MB per-file limit.
+models/*.joblib
+models/metadata.json
