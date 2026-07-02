@@ -1,37 +1,49 @@
-"""FastAPI service that serves scikit-learn customer-behaviour & demand
-predictions to the Flutter admin "Insights" screen.
+"""FastAPI service that serves customer-behaviour & demand predictions to the
+Flutter admin "Insights" screen — via the Cloudflare Worker, which is the only
+intended caller (it RBAC-checks every app request and holds the API key).
 
 Endpoints
-  GET  /health                      → liveness + model status
+  GET  /health                      → liveness + model/registry status (open)
+  GET  /version                     → model registry (open)
   POST /predict                     → single-context demand + purchase intent
-  GET  /insights?...                → full dashboard payload (charts-ready)
+  GET  /insights?...                → market-level dashboard payload (legacy)
+  POST /insights                    → tenant-aware payload: the Worker sends the
+                                      tenant's real daily series + category mix;
+                                      forecasts come from THAT series (weekday
+                                      seasonality + trend + P10/P90 bands,
+                                      backtest-validated), with the model
+                                      supplying hour-of-day shape & event lift.
+  POST /churn/score                 → batch churn probabilities (real model when
+                                      trained, labelled heuristic otherwise)
+  POST /admin/retrain               → pull real rows from the Worker feed, blend
+                                      with the synthetic prior, retrain, bump
+                                      the registry version
+  POST /admin/drift                 → PSI drift check: recent real data vs the
+                                      distribution the models were trained on
 
-The Flutter app calls ``GET /insights`` and renders the pies/bars from the JSON.
-Models train lazily on first start if ``models/`` is empty.
+Auth: when the ML_API_KEY env var is set, every endpoint except /health and
+/version requires the matching ``x-api-key`` header.
 """
 
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import churn as CH
 import features as F
+import forecasting as FC
+import real_data as RD
+import registry as REG
 import train as T
-
-app = FastAPI(title="Realtim Prediction Service", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # admin dashboard is a trusted first-party caller
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 _REG = None
 _CLF = None
@@ -65,9 +77,27 @@ def _ensure_models():
         _META = json.load(fh)
 
 
-@app.on_event("startup")
-def _startup():
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
     _ensure_models()
+    yield
+
+
+app = FastAPI(title="Realtim Prediction Service", version="2.0.0", lifespan=_lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # the Worker is the only real caller; key gates writes
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def require_key(x_api_key: str | None = Header(default=None)):
+    """Shared-secret gate. No-op until ML_API_KEY is configured, so a fresh
+    deployment keeps working while the secret is being set on both ends."""
+    expected = os.environ.get("ML_API_KEY", "")
+    if expected and x_api_key != expected:
+        raise HTTPException(status_code=401, detail="bad or missing x-api-key")
 
 
 def _frame(rows: list[dict]) -> pd.DataFrame:
@@ -94,6 +124,16 @@ def _resolve_event(event: str, disaster: str):
     return event, "none"
 
 
+def _intent_label(p: float) -> str:
+    if p >= 0.66:
+        return "High intent"
+    if p >= 0.40:
+        return "Medium intent"
+    if p >= 0.20:
+        return "Low intent"
+    return "Unlikely"
+
+
 # ── Single prediction ───────────────────────────────────────────────────────
 
 
@@ -107,7 +147,7 @@ class PredictIn(BaseModel):
     disaster: str = "none"
 
 
-@app.post("/predict")
+@app.post("/predict", dependencies=[Depends(require_key)])
 def predict(body: PredictIn):
     _ensure_models()
     when = F.parse_date(body.date)
@@ -127,31 +167,41 @@ def predict(body: PredictIn):
     }
 
 
-def _intent_label(p: float) -> str:
-    if p >= 0.66:
-        return "High intent"
-    if p >= 0.40:
-        return "Medium intent"
-    if p >= 0.20:
-        return "Low intent"
-    return "Unlikely"
-
-
 # ── Dashboard insights ───────────────────────────────────────────────────────
 
 
-@app.get("/insights")
-def insights(
-    date: str | None = None,
-    location: str = "islamabad",
-    age_group: str = "adult",
-    event: str = "auto",
-    disaster: str = "none",
-):
+class SeriesPoint(BaseModel):
+    date: str
+    orders: float = 0
+
+
+class InsightsIn(BaseModel):
+    date: str | None = None
+    location: str | None = None
+    age_group: str | None = None
+    event: str | None = None
+    disaster: str | None = None
+    tenant_id: str | None = None
+    # The tenant's REAL history, materialized by the Worker's rollups.
+    series: list[SeriesPoint] | None = None
+    category_mix: dict[str, float] | None = None
+
+
+def _build_insights(
+    *,
+    date: str | None,
+    location: str,
+    age_group: str,
+    event: str,
+    disaster: str,
+    series: list[dict] | None = None,
+    category_mix: dict | None = None,
+) -> dict:
     _ensure_models()
     base_date = F.parse_date(date)
     age = AGE_REP.get(age_group, 32)
     override, dis = _resolve_event(event, disaster)
+    reg_meta = REG.load()
 
     hours_sample = [8, 11, 13, 16, 19, 21]
 
@@ -169,33 +219,100 @@ def insights(
                 )
         return out
 
-    # 1) 7-day demand forecast (sum across categories, averaged over the hour grid).
-    forecast_by_day = []
-    for i in range(7):
-        day = base_date + timedelta(days=i)
-        rows = rows_for(day, override, dis, hours_sample)
-        # mean over hours, summed over categories ≈ representative daily demand.
-        d = _demand(rows).reshape(len(F.CATEGORIES), len(hours_sample)).mean(axis=1).sum()
-        forecast_by_day.append(
-            {"label": f"{WEEKDAY_SHORT[day.weekday()]} {day.day}", "value": round(float(d), 1)}
+    # ── Forecast: the tenant's own series when it carries enough signal ──
+    tenant_fc = FC.tenant_forecast([p for p in (series or [])]) if series else None
+    source = "tenant_model" if tenant_fc else "market_model"
+
+    # Event lift from the model (used to scale scenario previews).
+    base_rows = rows_for(base_date, "none", "none", hours_sample)
+    base_total = float(_demand(base_rows).sum()) or 1.0
+    event_impact = []
+    for ev in ["none", "ramadan", "eid_fitr", "eid_adha", "festival", "disaster"]:
+        ov, dv = _resolve_event(ev, "flood" if ev == "disaster" else "none")
+        ov = "none" if ev == "none" else ov
+        rows = rows_for(base_date, ov, dv, hours_sample)
+        total = float(_demand(rows).sum())
+        event_impact.append(
+            {"label": EVENT_LABELS[ev], "value": round(total / base_total, 2)}
+        )
+    sel_mult = 1.0
+    if event and event not in ("auto", "none"):
+        sel_mult = next(
+            (e["value"] for e in event_impact if e["label"] == EVENT_LABELS.get(event)),
+            1.0,
         )
 
-    # 2) Hourly demand curve for the base date (sum across categories).
-    demand_by_hour = []
+    backtest_smape = None
+    if tenant_fc:
+        forecast_by_day = [
+            {
+                "label": p["label"],
+                "value": round(p["value"] * sel_mult, 1),
+                "p10": round(p["p10"] * sel_mult, 1),
+                "p90": round(p["p90"] * sel_mult, 1),
+            }
+            for p in tenant_fc["points"]
+        ]
+        backtest_smape = tenant_fc["backtest_smape"]
+        daily_scale = max(
+            0.1, float(np.mean([p["value"] for p in forecast_by_day]))
+        )
+    else:
+        forecast_by_day = []
+        for i in range(7):
+            day = base_date + timedelta(days=i)
+            rows = rows_for(day, override, dis, hours_sample)
+            d = _demand(rows).reshape(len(F.CATEGORIES), len(hours_sample)).mean(axis=1).sum()
+            forecast_by_day.append(
+                {"label": f"{WEEKDAY_SHORT[day.weekday()]} {day.day}", "value": round(float(d), 1)}
+            )
+        # A tenant with SOME history but not enough to forecast still gets the
+        # market curve anchored to their own average volume — server-side now.
+        if series:
+            hist = [float(p["orders"]) for p in series]
+            hist_mean = float(np.mean([h for h in hist])) if hist else 0.0
+            model_mean = float(np.mean([p["value"] for p in forecast_by_day])) or 1.0
+            if hist_mean > 0:
+                k = hist_mean * sel_mult / model_mean
+                for p in forecast_by_day:
+                    p["value"] = round(p["value"] * k, 1)
+                source = "market_model_scaled"
+        daily_scale = max(0.1, float(np.mean([p["value"] for p in forecast_by_day])))
+
+    # ── Hourly curve: model shape, scaled to the forecast's daily volume ──
+    raw_hours = []
     for h in range(24):
         rows = rows_for(base_date, override, dis, [h])
-        demand_by_hour.append({"label": f"{h:02d}", "value": round(float(_demand(rows).sum()), 1)})
-
-    # 3) Product-demand share (pie) at the base date, summed over the hour grid.
-    cat_rows = rows_for(base_date, override, dis, hours_sample)
-    cat_demand = _demand(cat_rows).reshape(len(F.CATEGORIES), len(hours_sample)).sum(axis=1)
-    cat_total = float(cat_demand.sum()) or 1.0
-    category_share = [
-        {"label": c, "value": round(float(v), 1), "pct": round(float(v) / cat_total * 100, 1)}
-        for c, v in sorted(zip(F.CATEGORIES, cat_demand), key=lambda x: -x[1])
+        raw_hours.append(float(_demand(rows).sum()))
+    hour_total = sum(raw_hours) or 1.0
+    demand_by_hour = [
+        {"label": f"{h:02d}", "value": round(v / hour_total * daily_scale, 2)}
+        for h, v in enumerate(raw_hours)
     ]
 
-    # 4) Behaviour segments (pie): score a shopper population, bucket the intent.
+    # ── Category share: REAL mix when the tenant has one ──
+    if category_mix:
+        total_mix = sum(float(v) for v in category_mix.values()) or 1.0
+        category_share = [
+            {
+                "label": k,
+                "value": round(float(v), 1),
+                "pct": round(float(v) / total_mix * 100, 1),
+            }
+            for k, v in sorted(category_mix.items(), key=lambda x: -float(x[1]))
+        ][:8]
+        category_source = "real"
+    else:
+        cat_rows = rows_for(base_date, override, dis, hours_sample)
+        cat_demand = _demand(cat_rows).reshape(len(F.CATEGORIES), len(hours_sample)).sum(axis=1)
+        cat_total = float(cat_demand.sum()) or 1.0
+        category_share = [
+            {"label": c, "value": round(float(v), 1), "pct": round(float(v) / cat_total * 100, 1)}
+            for c, v in sorted(zip(F.CATEGORIES, cat_demand), key=lambda x: -x[1])
+        ]
+        category_source = "model"
+
+    # ── Behaviour segments (model-scored population) ──
     pop_rows = []
     for ag, a in AGE_REP.items():
         for c in F.CATEGORIES:
@@ -217,20 +334,7 @@ def insights(
     ]
     avg_intent = float(probs.mean())
 
-    # 5) Event impact (bar): total base-date demand under each event vs normal.
-    base_rows = rows_for(base_date, "none", "none", hours_sample)
-    base_total = float(_demand(base_rows).sum()) or 1.0
-    event_impact = []
-    for ev in ["none", "ramadan", "eid_fitr", "eid_adha", "festival", "disaster"]:
-        ov, dv = _resolve_event(ev, "flood" if ev == "disaster" else "none")
-        ov = "none" if ev == "none" else ov
-        rows = rows_for(base_date, ov, dv, hours_sample)
-        total = float(_demand(rows).sum())
-        event_impact.append(
-            {"label": EVENT_LABELS[ev], "value": round(total / base_total, 2)}
-        )
-
-    # 6) Feature importance (bar): which factors drive the predictions.
+    # ── Feature importance ──
     labels = _META.get("feature_labels", {})
     factors = _META.get("factor_importances", {})
     feature_importance = [
@@ -238,40 +342,70 @@ def insights(
         for k, v in sorted(factors.items(), key=lambda x: -x[1])
     ]
 
-    # KPIs + narrative.
+    # ── KPIs + narrative ──
     peak_day = max(forecast_by_day, key=lambda x: x["value"])
     peak_hour = max(demand_by_hour, key=lambda x: x["value"])
     demand_7d = round(sum(x["value"] for x in forecast_by_day), 0)
     top_cat = category_share[0]["label"] if category_share else "—"
     top_factor = feature_importance[0]["label"] if feature_importance else "—"
 
-    narrative = [
-        f"Forecast demand over the next 7 days is ~{int(demand_7d)} orders, "
-        f"peaking on {peak_day['label']}.",
-        f"Busiest hour is around {peak_hour['label']}:00; '{top_cat}' is the "
-        f"top product category.",
-        f"Average purchase intent across shopper segments is "
-        f"{round(avg_intent * 100)}%.",
-        f"The strongest predictor of behaviour is {top_factor.lower()}.",
-    ]
-    if event and event not in ("auto", "none"):
-        mult = next((e["value"] for e in event_impact
-                     if e["label"] == EVENT_LABELS.get(event)), None)
-        if mult:
-            narrative.insert(
-                0,
-                f"{EVENT_LABELS.get(event, event)} shifts demand to "
-                f"{mult}× the normal baseline.",
+    narrative = []
+    if source == "tenant_model":
+        narrative.append(
+            f"Forecast from YOUR order history ({tenant_fc['history_days']} days, "
+            f"{tenant_fc['history_orders']} orders): ~{int(demand_7d)} orders in "
+            f"the next 7 days, peaking on {peak_day['label']}."
+        )
+        if backtest_smape is not None:
+            narrative.append(
+                f"Backtest on your own last week: {backtest_smape}% average error "
+                f"(SMAPE) — the shaded band shows the P10–P90 range."
             )
+    elif source == "market_model_scaled":
+        narrative.append(
+            f"~{int(demand_7d)} orders expected in the next 7 days (market model "
+            f"anchored to your recent volume — the forecast switches to your own "
+            f"history once you have 2+ weeks of orders)."
+        )
+    else:
+        narrative.append(
+            f"Market-level forecast: ~{int(demand_7d)} orders over the next 7 "
+            f"days, peaking on {peak_day['label']}."
+        )
+    narrative.append(
+        f"Busiest hour is around {peak_hour['label']}:00; "
+        f"'{top_cat}' leads {'your real order mix' if category_source == 'real' else 'product demand'}."
+    )
+    narrative.append(
+        f"Average {_META.get('behavior_label', 'purchase intent')} across segments is "
+        f"{round(avg_intent * 100)}%; the strongest predictor is {top_factor.lower()}."
+    )
+    if event and event not in ("auto", "none") and sel_mult != 1.0:
+        narrative.insert(
+            0,
+            f"{EVENT_LABELS.get(event, event)} scenario applied: demand scaled to "
+            f"{sel_mult}× the normal baseline.",
+        )
 
     return {
         "ok": True,
-        "source": "model",
+        "source": source,
         "meta": {
-            "model": _META.get("model", "RandomForest (scikit-learn)"),
+            "model": (
+                f"Tenant series forecaster + {_META.get('model', 'RandomForest')}"
+                if source == "tenant_model"
+                else _META.get("model", "RandomForest (scikit-learn)")
+            ),
+            "version": reg_meta.get("version", 0),
             "trained_at": _META.get("trained_at"),
-            "metrics": _META.get("metrics", {}),
             "rows": _META.get("rows"),
+            "rows_real_demand": _META.get("rows_real_demand", 0),
+            "rows_real_behavior": _META.get("rows_real_behavior", 0),
+            "behavior_label": _META.get("behavior_label"),
+            "metrics": {
+                **_META.get("metrics", {}),
+                **({"backtest_smape": backtest_smape} if backtest_smape is not None else {}),
+            },
         },
         "context": {
             "date": base_date.isoformat(),
@@ -290,6 +424,7 @@ def insights(
         "forecast_by_day": forecast_by_day,
         "demand_by_hour": demand_by_hour,
         "category_share": category_share,
+        "category_source": category_source,
         "behavior_segments": behavior_segments,
         "event_impact": event_impact,
         "feature_importance": feature_importance,
@@ -302,13 +437,133 @@ def insights(
     }
 
 
+@app.get("/insights", dependencies=[Depends(require_key)])
+def insights(
+    date: str | None = None,
+    location: str = "islamabad",
+    age_group: str = "adult",
+    event: str = "auto",
+    disaster: str = "none",
+):
+    return _build_insights(
+        date=date, location=location, age_group=age_group,
+        event=event, disaster=disaster,
+    )
+
+
+@app.post("/insights", dependencies=[Depends(require_key)])
+def insights_tenant(body: InsightsIn):
+    series = [p.model_dump() for p in body.series] if body.series else None
+    return _build_insights(
+        date=body.date,
+        location=body.location or "islamabad",
+        age_group=body.age_group or "adult",
+        event=body.event or "auto",
+        disaster=body.disaster or "none",
+        series=series,
+        category_mix=body.category_mix,
+    )
+
+
+# ── Churn scoring ─────────────────────────────────────────────────────────────
+
+
+class ChurnIn(BaseModel):
+    customers: list[dict]
+
+
+@app.post("/churn/score", dependencies=[Depends(require_key)])
+def churn_score(body: ChurnIn):
+    probs, model = CH.score(body.customers)
+    return {"ok": True, "probs": probs, "model": model, "n": len(probs)}
+
+
+# ── Admin: retrain on real data + drift check ────────────────────────────────
+
+
+class RetrainIn(BaseModel):
+    days: int = 90
+    synth_rows: int = 24000
+
+
+@app.post("/admin/retrain", dependencies=[Depends(require_key)])
+def admin_retrain(body: RetrainIn):
+    global _REG, _CLF, _META
+    rows = RD.fetch_rows(days=min(365, max(7, body.days)))
+    demand_df, behavior_df, snapshot = RD.to_frames(rows)
+    meta = T.train(
+        n=body.synth_rows,
+        real={"demand_df": demand_df, "behavior_df": behavior_df, "snapshot": snapshot},
+    )
+    # Churn model from the same feed (trains only when there's enough signal).
+    churn_metrics = None
+    feats, labels = RD.churn_snapshots(rows)
+    if len(feats) > 0:
+        churn_metrics = CH.train_churn(feats, labels)
+        if churn_metrics:
+            REG.save({"churn_metrics": churn_metrics})
+    # Hot-swap the serving models.
+    _REG = joblib.load(T.REG_PATH)
+    _CLF = joblib.load(T.CLF_PATH)
+    _META = meta
+    reg_meta = REG.load()
+    return {
+        "ok": True,
+        "version": reg_meta.get("version"),
+        "rows_real": len(rows),
+        "rows_real_demand": meta.get("rows_real_demand"),
+        "rows_real_behavior": meta.get("rows_real_behavior"),
+        "behavior_label": meta.get("behavior_label"),
+        "metrics": meta.get("metrics"),
+        "churn": churn_metrics or "insufficient real data — heuristic serving",
+    }
+
+
+@app.post("/admin/drift", dependencies=[Depends(require_key)])
+def admin_drift():
+    reg_meta = REG.load()
+    trained = (reg_meta.get("training_snapshot") or {})
+    if not trained or not trained.get("rows"):
+        return {"ok": True, "drifted": False, "reason": "no real training snapshot yet"}
+    rows = RD.fetch_rows(days=14)
+    _, _, recent = RD.to_frames(rows)
+    if not recent or not recent.get("rows"):
+        return {"ok": True, "drifted": False, "reason": "no recent real rows"}
+    scores = {
+        dim: RD.psi(trained.get(dim, {}), recent.get(dim, {}))
+        for dim in ("category", "hour", "city")
+    }
+    worst = max(scores.values())
+    return {
+        "ok": True,
+        "psi": worst,
+        "scores": scores,
+        "drifted": worst > 0.25,  # standard PSI alert threshold
+        "trained_rows": trained.get("rows"),
+        "recent_rows": recent.get("rows"),
+    }
+
+
+# ── Liveness / registry ──────────────────────────────────────────────────────
+
+
+@app.get("/version")
+def version():
+    return {"ok": True, **REG.load()}
+
+
 @app.get("/health")
 def health():
     loaded = _REG is not None and _CLF is not None
+    reg_meta = REG.load()
     return {
         "ok": True,
         "model_loaded": loaded,
         "model": _META.get("model"),
+        "version": reg_meta.get("version", 0),
         "trained_at": _META.get("trained_at"),
+        "rows_real_demand": _META.get("rows_real_demand", 0),
+        "rows_real_behavior": _META.get("rows_real_behavior", 0),
         "metrics": _META.get("metrics", {}),
+        "auth": bool(os.environ.get("ML_API_KEY")),
     }
